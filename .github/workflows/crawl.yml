@@ -28,4 +28,10 @@ jobs:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
-        run: python -u agent.py
+        run: python -u agent.pyv
+        
+      - name: 🌐 Playwright 브라우저 설치
+        run: |
+          pip install playwright
+          playwright install chromium
+          playwright install-deps chromium
