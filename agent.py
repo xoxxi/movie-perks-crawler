@@ -24,6 +24,7 @@ load_dotenv()
 OPENAI_API_KEY    = os.getenv("OPENAI_API_KEY")
 SUPABASE_URL      = os.getenv("SUPABASE_URL")
 SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY")
+SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
 SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL")
 
 if not OPENAI_API_KEY:
@@ -32,7 +33,7 @@ if not SUPABASE_URL or not SUPABASE_ANON_KEY:
     raise RuntimeError("SUPABASE_URL 또는 SUPABASE_ANON_KEY 가 .env 에 없습니다.")
 
 llm      = ChatOpenAI(model="gpt-4o-mini", temperature=0, api_key=OPENAI_API_KEY)
-supabase = create_client(SUPABASE_URL, SUPABASE_ANON_KEY)
+supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
 
 TARGET_URLS = [
     {"url": "https://www.megabox.co.kr/event/movie",   "chain": "메가박스",  "type": "normal"},
@@ -122,8 +123,14 @@ def crawl_node(state: AgentState) -> AgentState:
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         context = browser.new_context(
-            user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
             viewport={"width": 1920, "height": 1080},
+            locale="ko-KR",
+            timezone_id="Asia/Seoul",
+            extra_http_headers={
+                "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            }
         )
         page = context.new_page()
 
@@ -174,7 +181,7 @@ def crawl_node(state: AgentState) -> AgentState:
             # 일반 사이트
             else:
                 try:
-                    resp = page.goto(url, wait_until="domcontentloaded", timeout=30000)
+                    resp = page.goto(url, wait_until="domcontentloaded", timeout=60000)
                     if resp and resp.status >= 400:
                         print(f"  ❌ HTTP {resp.status}")
                         continue
