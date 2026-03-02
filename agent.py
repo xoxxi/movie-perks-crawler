@@ -1,0 +1,423 @@
+"""
+movie-perks-crawler Agent v2.0 (LangGraph)
+- LangGraph로 구현한 진짜 AI 에이전트
+- 노드: 크롤링 → 분석 → 검증 → 재시도/저장 → 알림
+- 특전 0개면 AI가 스스로 프롬프트 바꿔서 재시도
+"""
+
+import os
+import json
+import re
+import urllib.request
+from typing import TypedDict
+from dotenv import load_dotenv
+from playwright.sync_api import sync_playwright
+from langchain_openai import ChatOpenAI
+from langgraph.graph import StateGraph, END
+from supabase import create_client
+
+load_dotenv()
+
+# ──────────────────────────────────────────
+# 환경변수
+# ──────────────────────────────────────────
+OPENAI_API_KEY    = os.getenv("OPENAI_API_KEY")
+SUPABASE_URL      = os.getenv("SUPABASE_URL")
+SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY")
+SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL")
+
+if not OPENAI_API_KEY:
+    raise RuntimeError("OPENAI_API_KEY 가 .env 에 없습니다.")
+if not SUPABASE_URL or not SUPABASE_ANON_KEY:
+    raise RuntimeError("SUPABASE_URL 또는 SUPABASE_ANON_KEY 가 .env 에 없습니다.")
+
+llm      = ChatOpenAI(model="gpt-4o-mini", temperature=0, api_key=OPENAI_API_KEY)
+supabase = create_client(SUPABASE_URL, SUPABASE_ANON_KEY)
+
+TARGET_URLS = [
+    {"url": "https://www.megabox.co.kr/event/movie",   "chain": "메가박스",  "type": "normal"},
+    {"url": "https://www.cgv.co.kr/culture-event/",    "chain": "CGV",       "type": "normal"},
+    {"url": "https://www.lottecinema.co.kr/NLCHS/Event/DetailList?code=20", "chain": "롯데시네마", "type": "lotte"},
+]
+
+# 프롬프트 전략 3단계 (0개 감지 시 자동으로 다음 단계로)
+PROMPT_STRATEGIES = [
+    {
+        "name": "기본",
+        "instruction": """영화 특전 정보를 추출해줘.
+포함: "증정", "굿즈", "포스터", "포토카드", "필름마크", "엽서", "스티커", "키링"
+제외: 할인/쿠폰 이벤트, 포토존만 있는 이벤트, 종료된 이벤트""",
+    },
+    {
+        "name": "관대",
+        "instruction": """영화 특전 정보를 넓게 추출해줘.
+포함: 실물 증정이 있는 모든 이벤트, 추첨 경품도 포함, "패키지", "MD", "기념품"도 포함
+제외: 순수 할인/쿠폰만 있는 이벤트""",
+    },
+    {
+        "name": "최대관대",
+        "instruction": """영화 관련 모든 이벤트를 최대한 넓게 추출해줘.
+상영회, 무대인사, 시사회, 특별 혜택 모두 포함.""",
+    },
+]
+
+
+# ──────────────────────────────────────────
+# 에이전트 상태 (노드들이 공유하는 데이터)
+# ──────────────────────────────────────────
+class AgentState(TypedDict):
+    pages:          list[dict]   # 크롤링 결과
+    perks:          list[dict]   # 추출된 특전
+    new_perks:      list[dict]   # DB에 새로 저장된 특전
+    retry_count:    int          # 재시도 횟수
+    strategy_index: int          # 현재 프롬프트 전략 번호
+    log:            list[str]    # 실행 로그
+
+
+# ──────────────────────────────────────────
+# 노드 1: 크롤링
+# ──────────────────────────────────────────
+def crawl_node(state: AgentState) -> AgentState:
+    print("\n" + "="*60)
+    print("📡 [노드 1] 크롤링 시작")
+    print("="*60)
+
+    results = []
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        context = browser.new_context(
+            user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+            viewport={"width": 1920, "height": 1080},
+        )
+        page = context.new_page()
+
+        for info in TARGET_URLS:
+            url, chain = info["url"], info["chain"]
+            crawl_type = info.get("type", "normal")
+            print(f"\n  → {chain} 크롤링 중...")
+
+            # 롯데시네마는 상세 페이지를 하나씩 들어가야 함
+            if crawl_type == "lotte":
+                try:
+                    page.goto(url, wait_until="domcontentloaded", timeout=30000)
+                    try:
+                        page.wait_for_load_state("networkidle", timeout=15000)
+                    except Exception:
+                        pass
+                    page.wait_for_timeout(5000)
+
+                    # 이벤트 링크 목록 수집
+                    links = page.evaluate("""
+                        () => {
+                            const anchors = document.querySelectorAll('a[href*="EventDetail"]');
+                            return Array.from(anchors).slice(0, 15).map(a => ({
+                                href: a.href,
+                                text: a.innerText.trim()
+                            }));
+                        }
+                    """)
+                    print(f"  → 롯데시네마 이벤트 링크 {len(links)}개 발견")
+
+                    # 각 상세 페이지 텍스트 합치기
+                    combined = ""
+                    for link in links[:10]:
+                        try:
+                            page.goto(link["href"], wait_until="domcontentloaded", timeout=20000)
+                            page.wait_for_timeout(3000)
+                            text = page.evaluate("document.body.innerText")
+                            combined += f"\n\n=== {link['text']} ===\n{text[:3000]}"
+                        except Exception:
+                            continue
+
+                    found = sum(1 for kw in ["증정","굿즈","포스터","포토카드","필름마크","엽서"] if kw in combined)
+                    print(f"  ✓ {chain}: {len(combined):,}자 | 키워드 {found}개")
+                    results.append({"url": url, "chain": chain, "content": combined[:100000], "keyword_count": found})
+                except Exception as e:
+                    print(f"  ❌ {chain} 오류: {e}")
+
+            # 일반 사이트
+            else:
+                try:
+                    resp = page.goto(url, wait_until="domcontentloaded", timeout=30000)
+                    if resp and resp.status >= 400:
+                        print(f"  ❌ HTTP {resp.status}")
+                        continue
+                    try:
+                        page.wait_for_load_state("networkidle", timeout=15000)
+                    except Exception:
+                        pass
+                    page.wait_for_timeout(5000)
+                    for _ in range(3):
+                        page.evaluate("window.scrollBy(0, 1000)")
+                        page.wait_for_timeout(800)
+
+                    text  = page.evaluate("document.body.innerText")
+                    found = sum(1 for kw in ["증정","굿즈","포스터","포토카드","필름마크","엽서"] if kw in text)
+                    print(f"  ✓ {chain}: {len(text):,}자 | 키워드 {found}개")
+                    results.append({"url": url, "chain": chain, "content": text[:100000], "keyword_count": found})
+                except Exception as e:
+                    print(f"  ❌ {chain} 오류: {e}")
+
+        context.close()
+        browser.close()
+
+    log = state.get("log", [])
+    log.append(f"크롤링 완료: {len(results)}개 페이지")
+    print(f"\n  ✅ {len(results)}개 페이지 수집 완료")
+    return {**state, "pages": results, "log": log}
+
+
+# ──────────────────────────────────────────
+# 노드 2: AI 분석 (특전 추출)
+# ──────────────────────────────────────────
+def analyze_node(state: AgentState) -> AgentState:
+    strategy_index = state.get("strategy_index", 0)
+    strategy       = PROMPT_STRATEGIES[strategy_index]
+    pages          = state.get("pages", [])
+
+    print("\n" + "="*60)
+    print(f"🤖 [노드 2] AI 분석 - 전략: [{strategy['name']}]")
+    print("="*60)
+
+    all_perks = []
+    for page in pages:
+        chain, content = page["chain"], page["content"]
+        print(f"\n  → {chain} 분석 중...")
+
+        prompt = f"""{strategy['instruction']}
+
+아래는 {chain} 이벤트 페이지 텍스트야:
+
+{content[:15000]}
+
+---
+반드시 JSON 배열 형식으로만 답해. 다른 설명 없이.
+형식:
+[
+  {{
+    "movie_title": "영화 제목",
+    "benefit_type": "포스터|포토카드|굿즈|필름마크|엽서|스티커|상영회|기타",
+    "week": 1,
+    "condition": "IMAX 한정 또는 null",
+    "detail": "특전 상세 설명"
+  }}
+]
+
+특전이 없으면 [] 반환."""
+
+        try:
+            response  = llm.invoke(prompt)
+            raw       = response.content.strip()
+            json_match = re.search(r"\[.*\]", raw, re.DOTALL)
+            if json_match:
+                parsed = json.loads(json_match.group())
+                for item in parsed:
+                    item["chain"]      = chain
+                    item["source_url"] = page["url"]
+                all_perks.extend(parsed)
+                print(f"  ✓ {chain}: {len(parsed)}개 추출")
+            else:
+                print(f"  ⚠️ {chain}: JSON 파싱 실패")
+        except Exception as e:
+            print(f"  ❌ {chain} LLM 오류: {e}")
+
+    log = state.get("log", [])
+    log.append(f"분석 완료 [{strategy['name']}]: {len(all_perks)}개 추출")
+    print(f"\n  ✅ 총 {len(all_perks)}개 특전 추출")
+    return {**state, "perks": all_perks, "log": log}
+
+
+# ──────────────────────────────────────────
+# 노드 3: 검증 (결과가 충분한가?)
+# ──────────────────────────────────────────
+def validate_node(state: AgentState) -> AgentState:
+    perks          = state.get("perks", [])
+    retry_count    = state.get("retry_count", 0)
+    strategy_index = state.get("strategy_index", 0)
+
+    print("\n" + "="*60)
+    print("🔍 [노드 3] 결과 검증")
+    print("="*60)
+    print(f"  추출된 특전 수: {len(perks)}개")
+    print(f"  재시도 횟수: {retry_count}/3")
+
+    log = state.get("log", [])
+
+    if len(perks) == 0 and retry_count < 3 and strategy_index < len(PROMPT_STRATEGIES) - 1:
+        print(f"  ⚠️ 특전 0개 → 다음 전략으로 재시도 결정")
+        log.append(f"검증 실패: 재시도 예정 (전략 → {strategy_index + 1})")
+    else:
+        status = "충분한 결과" if len(perks) > 0 else "모든 전략 소진"
+        print(f"  ✅ {status}")
+        log.append(f"검증 완료: {len(perks)}개")
+
+    return {
+        **state,
+        "retry_count":    retry_count + 1,
+        "strategy_index": strategy_index + 1,
+        "log":            log,
+    }
+
+
+# ──────────────────────────────────────────
+# 조건 분기: 재시도 or 저장?
+# ──────────────────────────────────────────
+def should_retry(state: AgentState) -> str:
+    perks          = state.get("perks", [])
+    retry_count    = state.get("retry_count", 0)
+    strategy_index = state.get("strategy_index", 0)
+
+    if len(perks) == 0 and retry_count <= 3 and strategy_index < len(PROMPT_STRATEGIES):
+        print(f"\n  🔄 재시도! (전략 {strategy_index}번으로)")
+        return "retry"
+    return "save"
+
+
+# ──────────────────────────────────────────
+# 노드 4: 저장
+# ──────────────────────────────────────────
+def save_node(state: AgentState) -> AgentState:
+    perks = state.get("perks", [])
+
+    print("\n" + "="*60)
+    print("💾 [노드 4] Supabase 저장")
+    print("="*60)
+
+    if not perks:
+        print("  저장할 특전 없음")
+        return {**state, "new_perks": []}
+
+    new_perks = []
+    for perk in perks:
+        row = {
+            "chain":             perk.get("chain"),
+            "movie_title":       perk.get("movie_title"),
+            "week":              perk.get("week"),
+            "benefit_type":      perk.get("benefit_type"),
+            "condition":         perk.get("condition"),
+            "source_url":        perk.get("source_url"),
+            "reliability_score": "high",
+            "status":            "active",
+        }
+        try:
+            res = supabase.table("movie_perks").insert(row).execute()
+            if res.data:
+                new_perks.append(perk)
+                print(f"  ✨ 신규: {perk.get('movie_title')} - {perk.get('benefit_type')}")
+        except Exception as e:
+            err = str(e).lower()
+            if "duplicate" in err or "unique" in err:
+                print(f"  ⊗ 중복: {perk.get('movie_title')}")
+            else:
+                print(f"  ❌ 오류: {perk.get('movie_title')}: {e}")
+
+    log = state.get("log", [])
+    log.append(f"저장 완료: 신규 {len(new_perks)}개 / 전체 {len(perks)}개")
+    print(f"\n  ✅ 신규 {len(new_perks)}개 저장 완료")
+    return {**state, "new_perks": new_perks, "log": log}
+
+
+# ──────────────────────────────────────────
+# 노드 5: Slack 알림
+# ──────────────────────────────────────────
+def notify_node(state: AgentState) -> AgentState:
+    new_perks = state.get("new_perks", [])
+
+    print("\n" + "="*60)
+    print("📣 [노드 5] Slack 알림")
+    print("="*60)
+
+    if not SLACK_WEBHOOK_URL:
+        print("  SLACK_WEBHOOK_URL 없음 → 스킵")
+        return state
+    if not new_perks:
+        print("  신규 특전 없음 → 알림 스킵")
+        return state
+
+    lines = [f"🎬 *오늘의 신규 영화 특전 {len(new_perks)}개*\n"]
+    for p in new_perks:
+        week_str = f" ({p['week']}주차)" if p.get("week") else ""
+        cond_str = f" | {p['condition']}" if p.get("condition") else ""
+        lines.append(f"• [{p['chain']}] *{p['movie_title']}*{week_str} → {p['benefit_type']}{cond_str}")
+        if p.get("source_url"):
+            lines.append(f"  🔗 {p['source_url']}")
+
+    payload = json.dumps({"text": "\n".join(lines)}).encode("utf-8")
+    req     = urllib.request.Request(SLACK_WEBHOOK_URL, data=payload, headers={"Content-Type": "application/json"})
+    try:
+        urllib.request.urlopen(req, timeout=10)
+        print(f"  ✅ {len(new_perks)}개 알림 전송 완료")
+    except Exception as e:
+        print(f"  ❌ 전송 실패: {e}")
+
+    log = state.get("log", [])
+    log.append(f"Slack 알림: {len(new_perks)}개 전송")
+    return {**state, "log": log}
+
+
+# ──────────────────────────────────────────
+# 그래프 조립
+# ──────────────────────────────────────────
+def build_graph():
+    graph = StateGraph(AgentState)
+
+    # 노드 등록
+    graph.add_node("crawl",    crawl_node)
+    graph.add_node("analyze",  analyze_node)
+    graph.add_node("validate", validate_node)
+    graph.add_node("save",     save_node)
+    graph.add_node("notify",   notify_node)
+
+    # 흐름 연결
+    graph.set_entry_point("crawl")
+    graph.add_edge("crawl",   "analyze")
+    graph.add_edge("analyze", "validate")
+
+    # 핵심: 검증 후 재시도 or 저장 분기
+    graph.add_conditional_edges(
+        "validate",
+        should_retry,
+        {
+            "retry": "analyze",  # ← 0개면 analyze로 다시 돌아감!
+            "save":  "save",
+        }
+    )
+
+    graph.add_edge("save",   "notify")
+    graph.add_edge("notify", END)
+
+    return graph.compile()
+
+
+# ──────────────────────────────────────────
+# 메인
+# ──────────────────────────────────────────
+def main():
+    print("\n" + "="*60)
+    print("🤖 영화 특전 크롤러 Agent v2.0 (LangGraph)")
+    print("="*60)
+
+    agent = build_graph()
+
+    initial_state: AgentState = {
+        "pages":          [],
+        "perks":          [],
+        "new_perks":      [],
+        "retry_count":    0,
+        "strategy_index": 0,
+        "log":            [],
+    }
+
+    final_state = agent.invoke(initial_state)
+
+    # 최종 로그 출력
+    print("\n" + "="*60)
+    print("📋 실행 요약")
+    print("="*60)
+    for entry in final_state.get("log", []):
+        print(f"  • {entry}")
+    print("\n✅ 에이전트 완료!")
+
+
+if __name__ == "__main__":
+    main()
