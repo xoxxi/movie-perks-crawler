@@ -12,3 +12,5 @@ __pycache__/
 
 # 테스트 파일
 *.png
+
+.html
