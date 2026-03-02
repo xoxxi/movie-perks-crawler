@@ -33,6 +33,8 @@ if not SUPABASE_URL or not SUPABASE_ANON_KEY:
     raise RuntimeError("SUPABASE_URL 또는 SUPABASE_ANON_KEY 가 .env 에 없습니다.")
 
 llm      = ChatOpenAI(model="gpt-4o-mini", temperature=0, api_key=OPENAI_API_KEY)
+
+print(f"SERVICE_KEY 앞 20자: {SUPABASE_SERVICE_KEY[:20] if SUPABASE_SERVICE_KEY else 'None'}")
 supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
 
 TARGET_URLS = [
