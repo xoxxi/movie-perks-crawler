@@ -38,11 +38,10 @@ print(f"SERVICE_KEY 앞 20자: {SUPABASE_SERVICE_KEY[:20] if SUPABASE_SERVICE_KE
 supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
 
 TARGET_URLS = [
-    {"url": "https://www.megabox.co.kr/event/movie",   "chain": "메가박스",  "type": "normal"},
-    {"url": "https://www.cgv.co.kr/culture-event/",    "chain": "CGV",       "type": "normal"},
+    {"url": "https://www.megabox.co.kr/event/movie", "chain": "메가박스", "type": "megabox"},
+    {"url": "https://www.cgv.co.kr/culture-event/", "chain": "CGV", "type": "normal"},
     {"url": "https://www.lottecinema.co.kr/NLCHS/Event/DetailList?code=20", "chain": "롯데시네마", "type": "lotte"},
 ]
-
 PROMPT_STRATEGIES = [
     {
         "name": "기본",
@@ -141,6 +140,54 @@ def crawl_node(state: AgentState) -> AgentState:
             crawl_type = info.get("type", "normal")
             print(f"\n  → {chain} 크롤링 중...")
 
+
+            # 메가박스는 eventBtn 카드 → 상세 페이지
+            if crawl_type == "megabox":
+                try:
+                    page.goto(url, wait_until="domcontentloaded", timeout=60000)
+                    try:
+                        page.wait_for_load_state("networkidle", timeout=15000)
+                    except Exception:
+                        pass
+                    page.wait_for_timeout(5000)
+
+                    # eventBtn 카드 전체 수집
+                    cards = page.evaluate("""
+                        () => {
+                            const items = document.querySelectorAll('a.eventBtn[data-no]');
+                            return Array.from(items).map(el => ({
+                                eventNo: el.getAttribute('data-no'),
+                                title: el.innerText.trim().split('\\n')[0]
+                            }));
+                        }
+                    """)
+                    print(f"  → 메가박스 이벤트 카드 {len(cards)}개 발견")
+
+                    # 특전 키워드 있는 카드만 필터
+                    keywords = ["증정", "굿즈", "포스터", "포토카드", "필름마크", "엽서", "스티커", "키링", "상영회"]
+                    filtered = [c for c in cards if any(kw in c["title"] for kw in keywords)]
+                    print(f"  → 특전 관련 {len(filtered)}개 필터링")
+
+                    # 각 상세 페이지 텍스트 수집
+                    combined = ""
+                    for card in filtered[:30]:
+                        detail_url = f"https://www.megabox.co.kr/event/detail?eventNo={card['eventNo']}"
+                        try:
+                            page.goto(detail_url, wait_until="domcontentloaded", timeout=20000)
+                            page.wait_for_timeout(2000)
+                            text = page.evaluate("document.body.innerText")
+                            combined += f"\n\n=== {card['title']} ===\n상세URL: {detail_url}\n{text[:3000]}"
+                        except Exception:
+                            continue
+
+                    found = sum(1 for kw in keywords if kw in combined)
+                    print(f"  ✓ {chain}: {len(combined):,}자 | 키워드 {found}개")
+                    results.append({"url": url, "chain": chain, "content": combined[:100000], "keyword_count": found})
+                except Exception as e:
+                    print(f"  ❌ {chain} 오류: {e}")
+
+
+
             # 롯데시네마는 상세 페이지를 하나씩 들어가야 함
             if crawl_type == "lotte":
                 try:
@@ -231,7 +278,8 @@ def analyze_node(state: AgentState) -> AgentState:
 
         prompt = f"""{strategy['instruction']}
 
-아래는 {chain} 이벤트 페이지 텍스트야:
+아래는 {chain} 이벤트 페이지 텍스트야.
+각 이벤트는 "=== 제목 ===" 으로 구분되고 "상세URL: ..." 형태로 URL이 있어.
 
 {content[:15000]}
 
@@ -243,7 +291,8 @@ def analyze_node(state: AgentState) -> AgentState:
     "movie_title": "영화 제목 (꺾쇠괄호 없이, 예: 범죄도시5)",
     "benefit_type": "포스터 또는 포토카드 또는 굿즈 또는 필름마크 또는 엽서 또는 스티커 또는 키링 또는 상영회 또는 기타 중 하나",
     "week": null,
-    "condition": "IMAX 한정 등 조건 있으면 작성, 없으면 null",
+    "condition": "조건 있으면 작성, 없으면 null",
+    "source_url": "해당 이벤트의 상세URL (텍스트에서 추출)",
     "detail": "특전 상세 설명"
   }}
 ]
