@@ -389,7 +389,7 @@ def save_node(state: AgentState) -> AgentState:
             "week":              perk.get("week"),
             "benefit_type":      perk.get("benefit_type"),
             "condition":         perk.get("condition"),
-            "source_url":        perk.get("source_url"),
+            "source_url": perk.get("source_url") or perk.get("detail_url") or page.get("url"),
             "reliability_score": "high",
             "status":            "active",
         }
@@ -407,7 +407,7 @@ def save_node(state: AgentState) -> AgentState:
                 continue
 
             res = supabase.table("movie_perks").insert(row).execute()
-            
+
             if res.data:
                 new_perks.append(perk)
                 print(f"  ✨ 신규: {perk.get('movie_title')} - {perk.get('benefit_type')}")
