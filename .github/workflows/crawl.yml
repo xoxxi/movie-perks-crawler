@@ -23,6 +23,10 @@ jobs:
 
       - name: 🌐 Playwright 브라우저 설치
         run: playwright install --with-deps chromium
+      
+      - name: 🔤 Tesseract OCR 설치
+        run: |
+          sudo apt-get install -y tesseract-ocr tesseract-ocr-kor
 
       - name: 🤖 에이전트 실행
         env:
@@ -33,6 +37,3 @@ jobs:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
         run: python -u agent.py
 
-      - name: 🔤 Tesseract OCR 설치
-        run: |
-          sudo apt-get install -y tesseract-ocr tesseract-ocr-kor
