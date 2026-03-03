@@ -42,6 +42,29 @@ TARGET_URLS = [
     {"url": "https://www.cgv.co.kr/culture-event/", "chain": "CGV", "type": "normal"},
     {"url": "https://www.lottecinema.co.kr/NLCHS/Event/DetailList?code=20", "chain": "롯데시네마", "type": "lotte"},
 ]
+def classify_benefit_from_title(title: str) -> str:
+    """이벤트 제목에서 특전 타입 추론"""
+    title_lower = title
+    if any(kw in title_lower for kw in ["포스터", "어진", "포토"]):
+        return "포스터"
+    if any(kw in title_lower for kw in ["포토카드", "포카"]):
+        return "포토카드"
+    if any(kw in title_lower for kw in ["키링"]):
+        return "키링"
+    if any(kw in title_lower for kw in ["엽서"]):
+        return "엽서"
+    if any(kw in title_lower for kw in ["스티커"]):
+        return "스티커"
+    if any(kw in title_lower for kw in ["필름마크", "필름"]):
+        return "필름마크"
+    if any(kw in title_lower for kw in ["굿즈", "MD", "기념품", "굿즈패키지"]):
+        return "굿즈"
+    if any(kw in title_lower for kw in ["상영회", "무대인사", "시사회", "메가토크"]):
+        return "상영회"
+    if any(kw in title_lower for kw in ["현장 증정", "현장이벤트", "현장 이벤트", "개봉주"]):
+        return "기타"  # 제목만으로 판단 불가 → OCR로 보완 예정
+    return "기타"
+
 PROMPT_STRATEGIES = [
     {
         "name": "기본",
@@ -308,6 +331,14 @@ def analyze_node(state: AgentState) -> AgentState:
                 for item in parsed:
                     item["chain"]      = chain
                     item["source_url"] = page["url"]
+
+                for item in parsed:
+                # AI 분류가 "기타"면 제목으로 재분류 시도
+                    if item.get("benefit_type") == "기타":
+                        title = item.get("movie_title", "") + " " + item.get("detail", "")
+                        reclassified = classify_benefit_from_title(title)
+                    if reclassified != "기타":
+                        item["benefit_type"] = reclassified
                 all_perks.extend(parsed)
                 print(f"  ✓ {chain}: {len(parsed)}개 추출")
             else:
@@ -389,7 +420,7 @@ def save_node(state: AgentState) -> AgentState:
             "week":              perk.get("week"),
             "benefit_type":      perk.get("benefit_type"),
             "condition":         perk.get("condition"),
-            "source_url": perk.get("source_url") or perk.get("detail_url") or page.get("url"),
+            "source_url": perk.get("source_url") or perk.get("detail_url") or "",
             "reliability_score": "high",
             "status":            "active",
         }
