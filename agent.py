@@ -394,7 +394,20 @@ def save_node(state: AgentState) -> AgentState:
             "status":            "active",
         }
         try:
+            # 같은 영화+극장+특전 조합이면 스킵
+            existing = supabase.table("movie_perks")\
+                .select("id")\
+                .eq("chain", row["chain"])\
+                .eq("movie_title", row["movie_title"])\
+                .eq("benefit_type", row["benefit_type"])\
+                .execute()
+
+            if existing.data:
+                print(f"  ⊗ 중복: {perk.get('movie_title')} - {perk.get('benefit_type')}")
+                continue
+
             res = supabase.table("movie_perks").insert(row).execute()
+            
             if res.data:
                 new_perks.append(perk)
                 print(f"  ✨ 신규: {perk.get('movie_title')} - {perk.get('benefit_type')}")
