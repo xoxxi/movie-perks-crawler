@@ -8,6 +8,10 @@ movie-perks-crawler Agent v2.0 (LangGraph)
 import os
 import json
 import re
+import pytesseract
+from PIL import Image
+import io
+import base64
 import urllib.request
 from typing import TypedDict
 from dotenv import load_dotenv
@@ -64,6 +68,21 @@ def classify_benefit_from_title(title: str) -> str:
     if any(kw in title_lower for kw in ["현장 증정", "현장이벤트", "현장 이벤트", "개봉주"]):
         return "기타"  # 제목만으로 판단 불가 → OCR로 보완 예정
     return "기타"
+
+def ocr_screenshot(page, url: str) -> str:
+    """페이지 스크린샷 찍고 OCR로 텍스트 추출"""
+    try:
+        screenshot = page.screenshot(full_page=True)
+        image = Image.open(io.BytesIO(screenshot))
+        # 이미지 크기 줄이기 (속도 향상)
+        width, height = image.size
+        if height > 3000:
+            image = image.crop((0, 0, width, 3000))
+        text = pytesseract.image_to_string(image, lang="kor+eng")
+        return text
+    except Exception as e:
+        print(f"  ⚠️ OCR 실패: {e}")
+        return ""
 
 PROMPT_STRATEGIES = [
     {
@@ -199,7 +218,11 @@ def crawl_node(state: AgentState) -> AgentState:
                             page.goto(detail_url, wait_until="domcontentloaded", timeout=20000)
                             page.wait_for_timeout(2000)
                             text = page.evaluate("document.body.innerText")
-                            combined += f"\n\n=== {card['title']} ===\n상세URL: {detail_url}\n{text[:3000]}"
+                            # 텍스트가 너무 짧으면 OCR로 보완
+                            if len(text) < 500:
+                                ocr_text = ocr_screenshot(page, detail_url)
+                                text = text + "\n[OCR]\n" + ocr_text
+                            combined += f"\n\n[EVENT_START]\n제목: {card['title']}\nURL: {detail_url}\n내용: {text[:3000]}\n[EVENT_END]"
                         except Exception:
                             continue
 
