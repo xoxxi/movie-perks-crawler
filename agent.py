@@ -337,8 +337,8 @@ def analyze_node(state: AgentState) -> AgentState:
                     if item.get("benefit_type") == "기타":
                         title = item.get("movie_title", "") + " " + item.get("detail", "")
                         reclassified = classify_benefit_from_title(title)
-                    if reclassified != "기타":
-                        item["benefit_type"] = reclassified
+                        if reclassified != "기타":
+                            item["benefit_type"] = reclassified
                 all_perks.extend(parsed)
                 print(f"  ✓ {chain}: {len(parsed)}개 추출")
             else:
