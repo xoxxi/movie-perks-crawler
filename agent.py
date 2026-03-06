@@ -43,7 +43,7 @@ supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
 
 TARGET_URLS = [
     {"url": "https://www.megabox.co.kr/event/movie", "chain": "메가박스", "type": "megabox"},
-    {"url": "https://www.cgv.co.kr/culture-event/", "chain": "CGV", "type": "normal"},
+    {"url": "https://www.cgv.co.kr/culture-event/", "chain": "CGV", "type": "cgv"},
     {"url": "https://www.lottecinema.co.kr/NLCHS/Event/DetailList?code=20", "chain": "롯데시네마", "type": "lotte"},
 ]
 def classify_benefit_from_title(title: str) -> str:
@@ -233,9 +233,43 @@ def crawl_node(state: AgentState) -> AgentState:
                     print(f"  ❌ {chain} 오류: {e}")
 
 
+            elif crawl_type == "cgv":
+                try:
+                    context2 = browser.new_context(
+                        user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                        viewport={"width": 1920, "height": 1080},
+                        locale="ko-KR",
+                        timezone_id="Asia/Seoul",
+                        extra_http_headers={
+                            "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8",
+                            "Cookie": "_ga=GA1.1.196570663.1770183080; ssoCheckYn=N; __cf_bm=LHRl8fEvAnSGMJsW6z3NkgbVyn1B3EMsCpfZyVLemfs-1772758151-1.0.1.1-3EHIx4X1nqBOzXBnUo0XpQkx6KQhC4PPWDm2DEafFnnN4Koi_WMypfGcrZB",
+                        }
+                    )
+                    page2 = context2.new_page()
+                    resp = page2.goto(url, wait_until="domcontentloaded", timeout=60000)
+                    if resp and resp.status >= 400:
+                        print(f"  ❌ HTTP {resp.status}")
+                        context2.close()
+                        continue
+                    try:
+                        page2.wait_for_load_state("networkidle", timeout=15000)
+                    except Exception:
+                        pass
+                    page2.wait_for_timeout(5000)
+                    for _ in range(3):
+                        page2.evaluate("window.scrollBy(0, 1000)")
+                        page2.wait_for_timeout(800)
+                    text = page2.evaluate("document.body.innerText")
+                    found = sum(1 for kw in ["증정","굿즈","포스터","포토카드","필름마크","엽서"] if kw in text)
+                    print(f"  ✓ {chain}: {len(text):,}자 | 키워드 {found}개")
+                    results.append({"url": url, "chain": chain, "content": text[:100000], "keyword_count": found})
+                    context2.close()
+                except Exception as e:
+                    print(f"  ❌ {chain} 오류: {e}")
 
+            
             # 롯데시네마는 상세 페이지를 하나씩 들어가야 함
-            if crawl_type == "lotte":
+            elif crawl_type == "lotte":
                 try:
                     page.goto(url, wait_until="domcontentloaded", timeout=30000)
                     try:
